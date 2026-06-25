@@ -69,7 +69,7 @@ The configuration page of the NWC Service Provider extension is available at `/n
 | relay                | URL of the nostr relay for dispatching and receiving NWC events. Use public relays or a custom one. Specify `nostrclient` to connect to the [nostrclient extension](https://github.com/lnbits/nostrclient). | nostrclient                     |
 | provider_key         | Nostr secret key of the NWC Service Provider.                                                                                                                                                               | Random key generated on install |
 | relay_alias          | Relay URL to display in pairing URLs. Set if different from `relay`.                                                                                                                                        | Empty (uses the `relay` value)  |
-| handle_missed_events | Number of seconds to look back for processing events missed while offline. Setting it to 0 disables this functionality.                                                                                     | 0                               |
+| handle_missed_events | Number of seconds to look back for processing events missed while offline. Setting it to 0 disables this functionality.                                                                                     | 120                             |
 
 > [!WARNING]
 >

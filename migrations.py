@@ -117,5 +117,5 @@ async def m006_default_config3(db):
         VALUES ('handle_missed_events', :value)
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
         """,
-        {"value": "0"},
+        {"value": "120"},
     )

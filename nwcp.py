@@ -124,6 +124,9 @@ class NWCServiceProvider:
         # Periodic info event resend loop
         self.info_event_task = None
 
+        # EOSE timeout task (fallback if relay never sends EOSE)
+        self.eose_timeout_task = None
+
         # Subscription
         self.sub = None
         self.rate_limit: dict[str, RateLimit] = {}
@@ -270,10 +273,43 @@ class NWCServiceProvider:
         await asyncio.sleep(limit.backoff)
         limit.last_attempt_time = int(time.time())
 
+    async def _process_stale_events(self):
+        if not self.sub:
+            return
+        stales = self.sub.get_stale()
+        if not stales:
+            return
+        logger.debug(f"Processing {len(stales)} stale events (EOSE timeout)")
+        for stale in stales:
+            try:
+                await self._handle_request(stale)
+            except Exception as e:
+                logger.error(f"Error handling stale event: {e}")
+
+    async def _eose_timeout(self):
+        await asyncio.sleep(10)
+        if self._is_shutting_down():
+            return
+        if not self.sub:
+            return
+        if not (self.sub.requests_eose and self.sub.responses_eose):
+            logger.warning(
+                "EOSE not received within 10s timeout, "
+                "processing pending events anyway"
+            )
+            self.sub.requests_eose = True
+            self.sub.responses_eose = True
+            await self._process_stale_events()
+
     async def _subscribe(self):
         """
         [Re]Subscribe to receive nip 47 requests and responses from the relay
         """
+        # Cancel previous EOSE timeout if any
+        if self.eose_timeout_task:
+            self.eose_timeout_task.cancel()
+            self.eose_timeout_task = None
+
         self.sub = MainSubscription()
         # Create requests subscription
         req_filter = {
@@ -293,6 +329,8 @@ class NWCServiceProvider:
         # Subscribe
         await self._send(["REQ", self.sub.requests_sub_id, req_filter])
         await self._send(["REQ", self.sub.responses_sub_id, res_filter])
+        # Start EOSE timeout guard
+        self.eose_timeout_task = asyncio.create_task(self._eose_timeout())
 
     async def _on_connection(self, _):
         """
@@ -469,6 +507,10 @@ class NWCServiceProvider:
         #         service connection and do not have a response yet,
         #         are considered stale, we will process them now
         if self.sub.requests_eose and self.sub.responses_eose:
+            # Cancel the EOSE timeout since we got both EOSEs
+            if self.eose_timeout_task:
+                self.eose_timeout_task.cancel()
+                self.eose_timeout_task = None
             stales = self.sub.get_stale()
             for stale in stales:
                 await self._handle_request(stale)
@@ -629,6 +671,12 @@ class NWCServiceProvider:
                 self.info_event_task.cancel()
         except Exception as e:
             logger.warning("Error closing info event loop: " + str(e))
+        # cancel eose timeout
+        try:
+            if self.eose_timeout_task:
+                self.eose_timeout_task.cancel()
+        except Exception as e:
+            logger.warning("Error closing eose timeout task: " + str(e))
         # close the websocket
         try:
             if self.ws:
