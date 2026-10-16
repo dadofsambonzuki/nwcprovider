@@ -4,7 +4,7 @@ from math import ceil
 from typing import Any
 
 from bolt11 import decode as bolt11_decode
-from lnbits.core.crud import get_payments, get_wallet, get_wallet_payment
+from lnbits.core.crud import get_payments_paginated, get_wallet, get_wallet_payment
 from lnbits.core.models import Payment
 from lnbits.core.services import (
     check_transaction_status,
@@ -435,18 +435,44 @@ async def _on_list_transactions(
     filters: Filters = Filters()
     filters.where(["time <= :tuntil"])
     filters.values({"tuntil": tuntil})
-    history = await get_payments(
-        wallet_id=nwc.wallet,
-        complete=True,
-        pending=unpaid,
-        outgoing=not tx_type or tx_type == "outgoing",
-        incoming=not tx_type or tx_type == "incoming",
-        since=tfrom,
-        exclude_uncheckable=False,
-        filters=filters,
-        limit=limit,
-        offset=offset,
-    )
+    # `get_payments` (the wrapper used here before) has no `failed` flag, and its
+    # complete/pending/failed clauses are mutually exclusive, so history takes
+    # two queries: the settled/pending page, and the failed page. FAILED rows are
+    # how a client learns a payment went wrong - LNbits marks an expired incoming
+    # invoice FAILED, and a failed outgoing payment is otherwise invisible in
+    # history, though NWC-05 defines both states for it.
+    # Both queries fetch the whole window (`limit + offset` rows) and are merged
+    # by time here: an offset can only be applied once the pages are merged.
+    filters.sortby = "time"
+    filters.direction = "desc"
+    filters.limit = limit + offset
+    filters.offset = 0
+    settled = (
+        await get_payments_paginated(
+            wallet_id=nwc.wallet,
+            complete=True,
+            pending=unpaid,
+            outgoing=not tx_type or tx_type == "outgoing",
+            incoming=not tx_type or tx_type == "incoming",
+            since=tfrom,
+            exclude_uncheckable=False,
+            filters=filters,
+        )
+    ).data
+    failed = (
+        await get_payments_paginated(
+            wallet_id=nwc.wallet,
+            failed=True,
+            outgoing=not tx_type or tx_type == "outgoing",
+            incoming=not tx_type or tx_type == "incoming",
+            since=tfrom,
+            exclude_uncheckable=False,
+            filters=filters,
+        )
+    ).data
+    history = sorted(
+        [*settled, *failed], key=lambda payment: payment.time, reverse=True
+    )[offset : offset + limit]
     transactions: list[dict] = []
     p: Payment
     for p in history:

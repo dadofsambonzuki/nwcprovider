@@ -4,6 +4,7 @@ from typing import Any, cast
 
 import pytest
 from lnbits.core.models import Payment
+from lnbits.db import Page
 
 from ... import tasks
 
@@ -13,13 +14,14 @@ def _payment(
     amount: int,
     expires_in: int | None = None,
     preimage: str | None = None,
+    time: datetime | None = None,
 ) -> Payment:
     expiry = (
         datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         if expires_in is not None
         else None
     )
-    return Payment(
+    payment = Payment(
         checking_id="c" * 64,
         payment_hash="b" * 64,
         wallet_id="wallet123",
@@ -30,21 +32,33 @@ def _payment(
         expiry=expiry,
         preimage=preimage,
     )
+    if time is not None:
+        payment.time = time
+    return payment
 
 
-def _patch_nwc(monkeypatch, payments: list[Payment], permission: str) -> None:
+def _patch_nwc(
+    monkeypatch,
+    payments: list[Payment],
+    permission: str,
+    failed_payments: list[Payment] | None = None,
+    calls: list[dict] | None = None,
+) -> None:
     async def fake_get_nwc(*args, **kwargs):
         return SimpleNamespace(wallet="wallet123", get_permissions=lambda: [permission])
 
     async def fake_get_wallet_payment(*args, **kwargs):
         return payments[0]
 
-    async def fake_get_payments(*args, **kwargs):
-        return payments
+    async def fake_get_payments_paginated(*args, **kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        rows = (failed_payments or []) if kwargs.get("failed") else payments
+        return Page(data=rows, total=len(rows))
 
     monkeypatch.setattr(tasks, "get_nwc", fake_get_nwc)
     monkeypatch.setattr(tasks, "get_wallet_payment", fake_get_wallet_payment)
-    monkeypatch.setattr(tasks, "get_payments", fake_get_payments)
+    monkeypatch.setattr(tasks, "get_payments_paginated", fake_get_payments_paginated)
     monkeypatch.setattr(
         tasks,
         "bolt11_decode",
@@ -64,10 +78,22 @@ async def _lookup_invoice(monkeypatch, payments: list[Payment]) -> dict:
     return res
 
 
-async def _list_transactions(monkeypatch, payments: list[Payment]) -> dict:
-    _patch_nwc(monkeypatch, payments, permission="history")
+async def _list_transactions(
+    monkeypatch,
+    payments: list[Payment],
+    failed_payments: list[Payment] | None = None,
+    calls: list[dict] | None = None,
+    params: dict | None = None,
+) -> dict:
+    _patch_nwc(
+        monkeypatch,
+        payments,
+        permission="history",
+        failed_payments=failed_payments,
+        calls=calls,
+    )
     [(res, error, _)] = await tasks._on_list_transactions(
-        cast(Any, None), "a" * 64, {"params": {"limit": 10}}
+        cast(Any, None), "a" * 64, {"params": params if params else {"limit": 10}}
     )
     assert error is None
     assert isinstance(res, dict)
@@ -203,8 +229,11 @@ async def test_lookup_invoice_settled_keeps_settlement_fields(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_transactions_states(monkeypatch):
-    pending_outgoing = _payment("pending", -123000)
-    settled_incoming = _payment("success", 123000, preimage="d" * 64)
+    now = datetime.now(timezone.utc)
+    pending_outgoing = _payment("pending", -123000, time=now)
+    settled_incoming = _payment(
+        "success", 123000, preimage="d" * 64, time=now - timedelta(hours=1)
+    )
     res = await _list_transactions(monkeypatch, [pending_outgoing, settled_incoming])
 
     transactions = res["transactions"]
@@ -213,3 +242,40 @@ async def test_list_transactions_states(monkeypatch):
     assert "preimage" not in transactions[0]
     assert transactions[1]["settled_at"] == int(settled_incoming.time.timestamp())
     assert transactions[1]["preimage"] == "d" * 64
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_reports_failed_rows(monkeypatch):
+    """A failed payment must reach history: NWC-05 defines the state for it."""
+    expired = _payment("failed", 123000, expires_in=-3600)
+    res = await _list_transactions(monkeypatch, [], failed_payments=[expired])
+
+    assert [tx["state"] for tx in res["transactions"]] == ["expired"]
+    assert "preimage" not in res["transactions"][0]
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_merges_the_failed_page_in_time_order(monkeypatch):
+    now = datetime.now(timezone.utc)
+    newer_settled = _payment("success", 123000, preimage="d" * 64, time=now)
+    older_failed = _payment("failed", -123000, time=now - timedelta(hours=2))
+
+    calls: list[dict] = []
+    res = await _list_transactions(
+        monkeypatch, [newer_settled], failed_payments=[older_failed], calls=calls
+    )
+
+    assert [tx["state"] for tx in res["transactions"]] == ["settled", "failed"]
+    assert [call.get("failed") for call in calls] == [None, True]
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_pages_the_merged_rows(monkeypatch):
+    calls: list[dict] = []
+    await _list_transactions(
+        monkeypatch, [], calls=calls, params={"limit": 2, "offset": 5}
+    )
+
+    # both queries fetch the whole window; the offset is applied after merging
+    assert [call["filters"].limit for call in calls] == [7, 7]
+    assert [call["filters"].offset for call in calls] == [0, 0]
